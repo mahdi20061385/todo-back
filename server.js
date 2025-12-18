@@ -3,7 +3,7 @@ import cors from "cors";
 import webpush from "web-push";
 
 const app = express();
-app.use(cors());
+app.use(cors()); // اگر دامنه مشخص است، اینجا محدود کن
 app.use(express.json());
 
 // تولید کلیدهای VAPID در شروع (برای تولید واقعی، ثابت نگه‌دار و محیطی کن)
@@ -16,32 +16,35 @@ webpush.setVapidDetails(
 );
 
 // ذخیره‌ی Subscription ها در حافظه (برای تولید واقعی: DB)
-const subscriptions = new Map(); // key: deviceId, value: subscription
+const subscriptions = new Map(); // key: endpoint, value: subscription
+
+// برنامه‌ریزی ساده‌ی یادآوری‌ها در حافظه
+const schedules = new Map(); // key: id, value: timeoutId
 
 // ارائه کلید عمومی VAPID
 app.get("/vapidPublicKey", (req, res) => {
   res.json({ key: vapidKeys.publicKey });
 });
 
-// ثبت subscription برای هر دستگاه جدا
+// ثبت subscription
 app.post("/register", (req, res) => {
-  const { deviceId, subscription } = req.body;
-  if (!deviceId || !subscription) {
+  const sub = req.body;
+  if (!sub || !sub.endpoint)
     return res.status(400).json({ error: "invalid subscription" });
-  }
-  subscriptions.set(deviceId, subscription);
+  subscriptions.set(sub.endpoint, sub);
   res.sendStatus(201);
 });
 
-// ارسال فوری برای تست (فقط به یک دستگاه خاص)
+// ارسال فوری برای تست
 app.post("/send", async (req, res) => {
-  const { deviceId, title = "یادآوری", body = "" } = req.body || {};
-  const sub = subscriptions.get(deviceId);
-  if (!sub) return res.status(404).json({ error: "subscription not found" });
-
+  const { title = "یادآوری", body = "" } = req.body || {};
   const payload = JSON.stringify({ title, body });
   try {
-    await webpush.sendNotification(sub, payload);
+    await Promise.all(
+      [...subscriptions.values()].map((sub) =>
+        webpush.sendNotification(sub, payload)
+      )
+    );
     res.sendStatus(201);
   } catch (err) {
     console.error(err);
@@ -49,26 +52,49 @@ app.post("/send", async (req, res) => {
   }
 });
 
-// زمان‌بندی اعلان فقط برای همان deviceId
+// زمان‌بندی یادآوری
 app.post("/schedule", (req, res) => {
-  const { todoId, title, atISO, deviceId } = req.body;
-  const sub = subscriptions.get(deviceId);
-  if (!sub) return res.status(404).json({ error: "subscription not found" });
-  if (!todoId || !title || !atISO) {
+  const { todoId, title, atISO, url } = req.body || {};
+  if (!todoId || !title || !atISO)
     return res.status(400).json({ error: "missing fields" });
-  }
 
-  const delay = new Date(atISO).getTime() - Date.now();
-  if (delay <= 0) {
+  const at = new Date(atISO).getTime();
+  const now = Date.now();
+  const delay = at - now;
+
+  if (delay <= 0)
     return res.status(400).json({ error: "time must be in the future" });
-  }
 
-  setTimeout(() => {
-    const payload = JSON.stringify({ title: "یادآوری", body: title });
-    webpush.sendNotification(sub, payload).catch(console.error);
+  // setTimeout ساده (اگر سرور ریستارت شود، از بین می‌رود؛ برای تولید واقعی: cron + DB)
+  const timeoutId = setTimeout(async () => {
+    const payload = JSON.stringify({ title: "یادآوری", body: title, url });
+    try {
+      await Promise.all(
+        [...subscriptions.values()].map((sub) =>
+          webpush.sendNotification(sub, payload)
+        )
+      );
+    } catch (err) {
+      console.error("push error", err);
+    } finally {
+      schedules.delete(todoId);
+    }
   }, delay);
 
+  schedules.set(todoId, timeoutId);
   res.sendStatus(201);
+});
+
+// لغو زمان‌بندی (اختیاری)
+app.post("/unschedule", (req, res) => {
+  const { todoId } = req.body || {};
+  if (!todoId) return res.status(400).json({ error: "missing todoId" });
+  const timeoutId = schedules.get(todoId);
+  if (timeoutId) {
+    clearTimeout(timeoutId);
+    schedules.delete(todoId);
+  }
+  res.sendStatus(200);
 });
 
 // پورت
